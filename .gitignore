@@ -3,3 +3,14 @@ dist/
 __pycache__/
 *.pyc
 .DS_Store
+
+# The tool's default output folder
+Serum 2.0.23 versions/
+
+# Local test material. Presets are somebody else's paid content and must never
+# be published, so they are ignored by pattern and not just by folder, and the
+# reference copies kept locally (one per schema version) stay untracked.
+reference-presets/
+*.SerumPreset
+*.SerumPack
+*.fxp
