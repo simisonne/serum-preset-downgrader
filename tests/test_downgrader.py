@@ -14,6 +14,7 @@ import struct
 import sys
 import tempfile
 import unittest
+import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -284,6 +285,148 @@ class CommandLineTests(unittest.TestCase):
             self.assertEqual(exit_code, 1)
             self.assertEqual(os.listdir(os.path.join(folder, 'out')),
                              ['Good.SerumPreset'])
+
+
+class PackTests(unittest.TestCase):
+    """A .SerumPack is a zip of presets plus the wavetables they use."""
+
+    def make_pack(self, folder, presets=2, manifest=None, extra=True,
+                  name='Test Bank.SerumPack'):
+        path = os.path.join(folder, name)
+        with zipfile.ZipFile(path, 'w') as pack:
+            pack.writestr('Presets/Packs/@test/Test Bank/.SerumPack.json',
+                          json.dumps(manifest if manifest is not None else {
+                              'author': '@test', 'description': '',
+                              'name': 'Test Bank', 'presetVersion': 11.0,
+                              'productVersion': '2.1.5', 'url': ''},
+                              sort_keys=True, separators=(',', ':')))
+            if extra:
+                pack.writestr('Tables/Packs/@test/Test Bank/table.wav',
+                              b'RIFF' + bytes(range(256)), zipfile.ZIP_DEFLATED)
+            for index in range(presets):
+                pack.writestr(f'Presets/Packs/@test/Test Bank/Preset {index}.SerumPreset',
+                              build_preset(sample_payload()))
+            pack.writestr('Samples/Packs/@test/Test Bank/last.wav', b'RIFFlast')
+        return path
+
+    def test_converts_every_preset_and_keeps_everything_else(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = self.make_pack(folder, presets=3)
+            with zipfile.ZipFile(path) as original:
+                before = original.namelist()
+            final, done, skipped = tool.convert_pack(
+                path, os.path.join(folder, 'out'), '2.0.23', 9.0, quiet=True)
+            self.assertEqual((done, skipped), (3, 0))
+            with zipfile.ZipFile(final) as rebuilt:
+                self.assertEqual(rebuilt.namelist(), before)
+                manifest = json.loads(rebuilt.read(
+                    'Presets/Packs/@test/Test Bank/.SerumPack.json'))
+                self.assertEqual(manifest['productVersion'], '2.0.23')
+                self.assertEqual(manifest['presetVersion'], 9.0)
+                self.assertEqual(manifest['author'], '@test')
+                self.assertEqual(rebuilt.read('Tables/Packs/@test/Test Bank/table.wav'),
+                                 b'RIFF' + bytes(range(256)))
+                preset = tool.Preset.from_bytes(rebuilt.read(
+                    'Presets/Packs/@test/Test Bank/Preset 2.SerumPreset'))
+                self.assertEqual(preset.build, '2.0.23')
+                self.assertEqual(preset.schema, 9.0)
+                self.assertTrue(preset.hash_ok())
+
+    def test_originals_are_never_touched(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = self.make_pack(folder, presets=1)
+            with open(path, 'rb') as handle:
+                before = handle.read()
+            tool.convert_pack(path, os.path.join(folder, 'out'),
+                              '2.0.23', 9.0, quiet=True)
+            with open(path, 'rb') as handle:
+                self.assertEqual(handle.read(), before)
+
+    def test_a_pack_with_nothing_to_do_writes_no_copy(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = self.make_pack(folder, presets=1, manifest={
+                'author': '@test', 'presetVersion': 9.0,
+                'productVersion': '2.0.23'})
+            # Rebuild the preset inside at the target version.
+            with zipfile.ZipFile(path) as pack:
+                names = pack.namelist()
+                blobs = {n: pack.read(n) for n in names}
+            target = build_preset(sample_payload(), build='2.0.23', schema=9.0)
+            blobs['Presets/Packs/@test/Test Bank/Preset 0.SerumPreset'] = target
+            with zipfile.ZipFile(path, 'w') as pack:
+                for name in names:
+                    pack.writestr(name, blobs[name])
+            out = os.path.join(folder, 'out')
+            final, done, skipped = tool.convert_pack(path, out, '2.0.23', 9.0,
+                                                     quiet=True)
+            self.assertIsNone(final)
+            self.assertEqual((done, skipped), (0, 1))
+            self.assertFalse(os.path.exists(out))
+
+    def test_a_stale_manifest_alone_is_restamped(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = self.make_pack(folder, presets=0, manifest={
+                'author': '@test', 'presetVersion': 11.0,
+                'productVersion': '2.1.5'})
+            # One preset that is already old enough lives in the pack.
+            with zipfile.ZipFile(path, 'a') as pack:
+                pack.writestr('Presets/Packs/@test/Test Bank/Old.SerumPreset',
+                              build_preset(sample_payload(), build='2.0.23',
+                                           schema=9.0))
+            final, done, skipped = tool.convert_pack(
+                path, os.path.join(folder, 'out'), '2.0.23', 9.0, quiet=True)
+            self.assertEqual((done, skipped), (0, 1))
+            with zipfile.ZipFile(final) as rebuilt:
+                manifest = json.loads(rebuilt.read(
+                    'Presets/Packs/@test/Test Bank/.SerumPack.json'))
+                self.assertEqual(manifest['productVersion'], '2.0.23')
+
+    def test_a_damaged_preset_fails_the_pack_and_leaves_nothing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = self.make_pack(folder, presets=1)
+            with zipfile.ZipFile(path, 'a') as pack:
+                pack.writestr('Presets/Packs/@test/Test Bank/Broken.SerumPreset',
+                              b'this is not a preset')
+            out = os.path.join(folder, 'out')
+            with self.assertRaises(ValueError):
+                tool.convert_pack(path, out, '2.0.23', 9.0, quiet=True)
+            self.assertFalse(os.path.exists(out))
+
+    def test_a_pack_without_presets_is_refused(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = self.make_pack(folder, presets=0)
+            with self.assertRaises(ValueError):
+                tool.convert_pack(path, os.path.join(folder, 'out'),
+                                  '2.0.23', 9.0, quiet=True)
+
+    def test_conversion_into_the_source_folder_does_not_overwrite(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = self.make_pack(folder, presets=1)
+            with open(path, 'rb') as handle:
+                before = handle.read()
+            final, _, _ = tool.convert_pack(path, folder, '2.0.23', 9.0,
+                                            quiet=True)
+            self.assertNotEqual(os.path.abspath(final), os.path.abspath(path))
+            self.assertIn('2.0.23', os.path.basename(final))
+            with open(path, 'rb') as handle:
+                self.assertEqual(handle.read(), before)
+
+    def test_the_command_line_accepts_a_pack(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = self.make_pack(folder, presets=2)
+            out = os.path.join(folder, 'out')
+            self.assertEqual(tool.main([path, '--out-dir', out]), 0)
+            self.assertEqual(os.listdir(out), ['Test Bank.SerumPack'])
+
+    def test_a_folder_with_a_pack_and_loose_presets_does_both(self):
+        with tempfile.TemporaryDirectory() as folder:
+            self.make_pack(folder, presets=1)
+            with open(os.path.join(folder, 'Loose.SerumPreset'), 'wb') as handle:
+                handle.write(build_preset(sample_payload()))
+            out = os.path.join(folder, 'out')
+            tool.main([folder, '--out-dir', out])
+            self.assertEqual(sorted(os.listdir(out)),
+                             ['Loose.SerumPreset', 'Test Bank.SerumPack'])
 
 
 if __name__ == '__main__':

@@ -17,10 +17,12 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import struct
 import sys
+import zipfile
 
-__version__ = '1.0'
+__version__ = '1.1'
 
 try:
     import zstandard
@@ -31,6 +33,12 @@ except ImportError:  # pragma: no cover - friendly message for a missing dep
 MAGIC = b'XferJson\x00'
 ENCODING_ZSTD = 2
 
+# A .SerumPack is a zip holding a whole bank: many .SerumPreset files plus the
+# wavetables, samples and multisamples they point at.
+PACK_SUFFIX = '.serumpack'
+PACK_ZIP_MAGIC = b'PK\x03\x04'
+PACK_MANIFEST = '.SerumPack.json'
+
 # Serum stores a schema number inside the preset next to the build string. Both
 # are written twice, once in the small JSON header and once in the payload.
 KNOWN_VERSIONS = {
@@ -38,18 +46,22 @@ KNOWN_VERSIONS = {
     '2.0.20': 7.0,
     '2.0.23': 9.0,
     '2.0.24': 9.0,
+    '2.1.4': 10.0,
     '2.1.5': 11.0,
 }
 DEFAULT_TARGET = '2.0.23'
 
 USAGE = '''\
-Drag preset files or a folder onto this tool, or run it from a terminal:
+Drag preset files, a .SerumPack bank or a folder onto this tool, or run it
+from a terminal:
 
     python serum_preset_downgrader.py "My Preset.SerumPreset"
+    python serum_preset_downgrader.py "My Bank.SerumPack"
     python serum_preset_downgrader.py "C:/Presets/Some Pack"
 
 It writes fixed copies into a folder called "Serum 2.0.23 versions" next to
-your presets, and leaves the originals alone.'''
+your presets, and leaves the originals alone. A whole bank is converted in one
+go, with its wavetables and samples carried over untouched.'''
 
 # Serum 2.1 writes this one as a named string ("On", "Sustain") while 2.0.x
 # stores a plain number. Handing a string to the older loader crashes the host
@@ -239,7 +251,17 @@ class Preset:
     def __init__(self, path):
         self.path = path
         with open(path, 'rb') as handle:
-            blob = handle.read()
+            self._parse(handle.read())
+
+    @classmethod
+    def from_bytes(cls, blob, path='<packed preset>'):
+        """Parse a preset that is already in memory, as inside a .SerumPack."""
+        preset = cls.__new__(cls)
+        preset.path = path
+        preset._parse(blob)
+        return preset
+
+    def _parse(self, blob):
         if blob[:9] != MAGIC:
             raise ValueError('not a Serum 2 preset')
         header_len = struct.unpack('<Q', blob[9:17])[0]
@@ -323,19 +345,27 @@ def _repair_global(payload):
 # --------------------------------------------------------------------------
 
 def _collect(paths):
-    """Expand files and folders into a list of .SerumPreset paths."""
-    found, skipped = [], []
+    """Expand files and folders into preset paths and .SerumPack paths."""
+    presets, packs, skipped = [], [], []
     for path in paths:
         if os.path.isdir(path):
             for name in sorted(os.listdir(path)):
                 full = os.path.join(path, name)
-                if name.lower().endswith('.serumpreset') and os.path.isfile(full):
-                    found.append(full)
+                if not os.path.isfile(full):
+                    continue
+                lower = name.lower()
+                if lower.endswith('.serumpreset'):
+                    presets.append(full)
+                elif lower.endswith(PACK_SUFFIX):
+                    packs.append(full)
         elif os.path.isfile(path):
-            found.append(path)
+            if path.lower().endswith(PACK_SUFFIX):
+                packs.append(path)
+            else:
+                presets.append(path)
         else:
             skipped.append((path, 'no such file or folder'))
-    return found, skipped
+    return presets, packs, skipped
 
 
 def _output_dir(files, requested):
@@ -345,30 +375,178 @@ def _output_dir(files, requested):
     return os.path.join(folder, 'Serum 2.0.23 versions')
 
 
+def _version_key(text):
+    """Turn '2.1.10' into a comparable tuple, so 2.10 beats 2.9."""
+    parts = []
+    for piece in str(text).split('.'):
+        digits = ''.join(c for c in piece if c.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+def _needs_conversion(build, schema, target, target_schema):
+    return schema > target_schema or _version_key(build) > _version_key(target)
+
+
+def convert_bytes(blob, target, schema, repair=True):
+    """Restamp one preset held in memory and check the result before returning."""
+    preset = Preset.from_bytes(blob)
+    fixed = preset.rebuild(target, schema, repair=repair)
+    check = Preset.from_bytes(fixed)
+    if not check.hash_ok():
+        raise ValueError('rebuilt checksum is wrong')
+    if check.schema != schema or check.build != target:
+        raise ValueError('rebuilt file has the wrong version')
+    if check.payload.get('version') != schema:
+        raise ValueError('rebuilt payload has the wrong version')
+    return fixed
+
+
 def convert_one(path, out_dir, target, schema, repair=True, quiet=False):
-    preset = Preset(path)
-    blob = preset.rebuild(target, schema, repair=repair)
-    # Read the result back and check it before writing anything.
-    check = os.path.join(out_dir, '.check.tmp')
+    with open(path, 'rb') as handle:
+        blob = handle.read()
+    preset = Preset.from_bytes(blob, path)
+    # The rebuilt file is checked before anything is written.
+    fixed = convert_bytes(blob, target, schema, repair=repair)
     os.makedirs(out_dir, exist_ok=True)
-    with open(check, 'wb') as handle:
-        handle.write(blob)
-    try:
-        verify = Preset(check)
-        if not verify.hash_ok():
-            raise ValueError('rebuilt checksum is wrong')
-        if verify.schema != schema or verify.build != target:
-            raise ValueError('rebuilt file has the wrong version')
-        if verify.payload.get('version') != schema:
-            raise ValueError('rebuilt payload has the wrong version')
-    except Exception:
-        os.remove(check)
-        raise
     final = os.path.join(out_dir, os.path.basename(path))
-    os.replace(check, final)
+    temp = final + '.part'
+    with open(temp, 'wb') as handle:
+        handle.write(fixed)
+    os.replace(temp, final)
     if not quiet:
         print(f'   {os.path.basename(path)}')
     return final, preset.build
+
+
+def _copied_info(info):
+    """A fresh ZipInfo for an entry, keeping the original's metadata."""
+    new = zipfile.ZipInfo(info.filename, info.date_time)
+    new.compress_type = info.compress_type
+    new.external_attr = info.external_attr
+    new.create_system = info.create_system
+    new.comment = info.comment
+    return new
+
+
+def _restamp_manifest(raw, target, schema):
+    """Update the version the pack browser reads before unpacking anything."""
+    try:
+        manifest = json.loads(raw)
+    except ValueError:
+        raise ValueError(f'{PACK_MANIFEST} is not readable JSON')
+    if not isinstance(manifest, dict):
+        raise ValueError(f'{PACK_MANIFEST} is not a JSON object')
+    manifest['productVersion'] = target
+    manifest['presetVersion'] = schema
+    return json.dumps(manifest, sort_keys=True, separators=(',', ':'),
+                      ensure_ascii=False).encode('utf-8')
+
+
+def _pack_output(path, out_dir, target):
+    base = os.path.basename(path)
+    final = os.path.join(out_dir, base)
+    if os.path.abspath(final) == os.path.abspath(path):
+        # Never write over the user's own pack, even if they asked for it.
+        stem, ext = os.path.splitext(base)
+        final = os.path.join(out_dir, f'{stem} ({target}){ext}')
+    return final
+
+
+def convert_pack(path, out_dir, target, schema, repair=True, quiet=False):
+    """Convert every preset inside a .SerumPack and return (path, done, skipped).
+
+    The pack is rebuilt as a zip with the same entries in the same order. Only
+    the presets and the small manifest are rewritten; wavetables, samples and
+    multisamples are copied through untouched.
+    """
+    with zipfile.ZipFile(path) as source:
+        infos = source.infolist()
+        if not infos or not path.lower().endswith(PACK_SUFFIX):
+            raise ValueError('not a Serum pack')
+        preset_infos = [i for i in infos
+                        if i.filename.lower().endswith('.serumpreset')]
+        if not preset_infos:
+            raise ValueError('the pack contains no presets')
+
+        todo, skipped = set(), 0
+        for info in preset_infos:
+            preset = Preset.from_bytes(source.read(info), info.filename)
+            if _needs_conversion(preset.build, preset.schema, target, schema):
+                todo.add(info.filename)
+            else:
+                skipped += 1
+
+        manifest_info = next((i for i in infos
+                              if i.filename.endswith(PACK_MANIFEST)), None)
+        manifest_raw = source.read(manifest_info) if manifest_info else None
+        manifest_dirty = False
+        if manifest_raw is not None:
+            manifest = json.loads(manifest_raw)
+            manifest_dirty = _needs_conversion(
+                manifest.get('productVersion', target),
+                float(manifest.get('presetVersion', 0)), target, schema)
+
+        if not todo and not manifest_dirty:
+            return None, 0, skipped
+
+        os.makedirs(out_dir, exist_ok=True)
+        final = _pack_output(path, out_dir, target)
+        temp = final + '.part'
+        try:
+            with zipfile.ZipFile(temp, 'w') as out:
+                for info in infos:
+                    name = info.filename
+                    new = _copied_info(info)
+                    if name in todo:
+                        fixed = convert_bytes(source.read(info), target, schema,
+                                              repair=repair)
+                        out.writestr(new, fixed)
+                    elif manifest_dirty and name == manifest_info.filename:
+                        out.writestr(new, _restamp_manifest(manifest_raw,
+                                                            target, schema))
+                    else:
+                        # Stream the big wavetable entries instead of holding
+                        # them in memory.
+                        with source.open(info) as src, out.open(new, 'w') as dst:
+                            shutil.copyfileobj(src, dst, 1 << 20)
+            _check_pack(path, temp, target, schema, todo, manifest_info)
+        except Exception:
+            if os.path.exists(temp):
+                os.remove(temp)
+            raise
+        os.replace(temp, final)
+    if not quiet:
+        print(f'   {os.path.basename(path)}  '
+              f'({len(todo)} presets converted, {skipped} already fine)')
+    return final, len(todo), skipped
+
+
+def _check_pack(original_path, new_path, target, schema, converted_names,
+                manifest_info=None):
+    """Compare the rebuilt pack against the original before it is used."""
+    manifest_name = manifest_info.filename if manifest_info else None
+    with zipfile.ZipFile(original_path) as before, \
+            zipfile.ZipFile(new_path) as after:
+        if before.namelist() != after.namelist():
+            raise ValueError('the rebuilt pack has a different file list')
+        for info in after.infolist():
+            if info.filename in converted_names:
+                preset = Preset.from_bytes(after.read(info), info.filename)
+                if preset.build != target or preset.schema != schema:
+                    raise ValueError(f'{info.filename} was not converted')
+                if not preset.hash_ok():
+                    raise ValueError(f'{info.filename} has a bad checksum')
+            elif info.filename == manifest_name:
+                manifest = json.loads(after.read(info))
+                if manifest.get('productVersion') != target:
+                    raise ValueError(f'{manifest_name} was not restamped')
+                if float(manifest.get('presetVersion', 0)) != schema:
+                    raise ValueError(f'{manifest_name} has the wrong schema')
+            elif info.CRC != before.getinfo(info.filename).CRC:
+                raise ValueError(f'{info.filename} changed while copying')
+        if after.testzip() is not None:
+            raise ValueError('the rebuilt pack is damaged')
 
 
 def main(argv=None):
@@ -376,7 +554,7 @@ def main(argv=None):
         prog='serum_preset_downgrader',
         description='Make Serum 2 presets saved in a newer Serum 2 open in an older one.')
     parser.add_argument('paths', nargs='*',
-                        help='preset files or folders to convert')
+                        help='preset files, .SerumPack banks or folders to convert')
     parser.add_argument('--target', default=DEFAULT_TARGET,
                         choices=sorted(KNOWN_VERSIONS),
                         help=f'Serum version to convert down to (default {DEFAULT_TARGET})')
@@ -390,26 +568,38 @@ def main(argv=None):
         print(USAGE)
         return 1
 
-    files, problems = _collect(args.paths)
-    files = [f for f in files if f.lower().endswith('.serumpreset')]
-    if not files:
-        print('No .SerumPreset files found.')
+    presets, packs, problems = _collect(args.paths)
+    if not presets and not packs:
+        print('No .SerumPreset or .SerumPack files found.')
         return 1
 
     target, schema = args.target, KNOWN_VERSIONS[args.target]
-    out_dir = _output_dir(files, args.out_dir)
+    out_dir = _output_dir(presets + packs, args.out_dir)
 
-    print(f'Converting {len(files)} preset(s) to Serum {target}')
+    print(f'Converting {len(presets) + len(packs)} file(s) to Serum {target}')
     done, up_to_date, failed = 0, 0, []
-    for path in files:
+    loose_done, banks_written = 0, 0
+    for path in presets:
         try:
             preset = Preset(path)
-            if preset.schema <= schema and preset.build <= target:
+            if not _needs_conversion(preset.build, preset.schema, target, schema):
                 up_to_date += 1
                 continue
             convert_one(path, out_dir, target, schema,
                         repair=not args.no_repair)
             done += 1
+            loose_done += 1
+        except Exception as error:
+            failed.append((os.path.basename(path), str(error)))
+
+    for path in packs:
+        try:
+            final, converted, already = convert_pack(
+                path, out_dir, target, schema, repair=not args.no_repair)
+            done += converted
+            up_to_date += already
+            if final:
+                banks_written += 1
         except Exception as error:
             failed.append((os.path.basename(path), str(error)))
 
@@ -427,8 +617,12 @@ def main(argv=None):
         print()
         print(f'Your fixed presets are in:\n   {out_dir}')
         print()
-        print('Copy that folder into your Serum 2 preset folder, then use')
-        print('Menu > Rescan Folders on Disk inside Serum 2.')
+        if banks_written:
+            print('Put a fixed bank wherever your Serum 2 keeps its banks, over the')
+            print('newer one, or drag it onto Serum 2 to install it.')
+        if loose_done:
+            print('Copy the fixed presets into your Serum 2 preset folder, then use')
+            print('Menu > Rescan Folders on Disk inside Serum 2.')
     return 1 if failed else 0
 
 

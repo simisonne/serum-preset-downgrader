@@ -100,10 +100,11 @@ HOW TO USE IT
 1. Unzip this folder somewhere, for example your Desktop.
    Keep the files together. Do not move the .bat file out on its own.
 
-2. Find the presets you want to convert.
+2. Find the presets you want to convert. That can be single presets, a whole
+   folder, or a .SerumPack bank file.
 
 3. Drag them onto "Downgrade presets.bat".
-   You can drag a single preset, several at once, or a whole folder.
+   You can drag one preset, several at once, a whole folder, or a bank.
 
 4. A black window opens and prints what it is doing. When it says the
    presets are in "Serum 2.0.23 versions", you are done.
@@ -120,8 +121,8 @@ Your original files are never changed. The tool only writes new copies.
 WHAT IT CANNOT DO
 -----------------
 
-This makes presets made in Serum 2.1.5 work in Serum 2.0.23. That pair is
-tested. Other versions may work but are not confirmed.
+This makes presets made in Serum 2.1.4 and 2.1.5 work in Serum 2.0.23. That
+pair is tested. Other versions may work but are not confirmed.
 
 If a preset uses something the older Serum simply does not have, it will
 sound slightly different, but it will still open.
